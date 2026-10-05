@@ -14,7 +14,7 @@ canvas.height = H * DPR;
 const PIXEL = '"Press Start 2P", monospace';
 const SANS = '"Segoe UI", system-ui, sans-serif';
 
-const FINISH = 60000;
+let FINISH = 60000;
 const CITY_BASE = 345;
 const ROAD_TOP = 372, ROAD_BOTTOM = 522;
 const laneY = l => 405 + l * 45;
@@ -46,6 +46,23 @@ const LANDMARKS = [
   { x: 21250, w: 320, draw: drawArena },
 ];
 const PARK = [7000, 9000]; // Englischer Garten: Bäume statt Häuser
+
+// Streckenlänge: alle Positionen oben gelten für die Grundstrecke und werden mitskaliert.
+// 1 px = 1/18 m (passend zu PX_TO_KMH), Grundstrecke 60000 px ≈ 3333 m.
+const PX_PER_M = 3.6 / PX_TO_KMH;
+const BASE_FINISH = FINISH;
+const BASE_POS = {
+  zones: ZONES.map(z => z.x), maibaeume: [...MAIBAEUME], landmarks: LANDMARKS.map(l => l.x), park: [...PARK],
+};
+let trackLengthM = Math.round(BASE_FINISH / PX_PER_M);
+function applyTrackLength() {
+  FINISH = Math.round(clamp(trackLengthM, 2000, 10000) * PX_PER_M);
+  const s = FINISH / BASE_FINISH;
+  ZONES.forEach((z, i) => { z.x = BASE_POS.zones[i] * s; });
+  LANDMARKS.forEach((l, i) => { l.x = BASE_POS.landmarks[i] * s; });
+  BASE_POS.maibaeume.forEach((x, i) => { MAIBAEUME[i] = x * s; });
+  BASE_POS.park.forEach((x, i) => { PARK[i] = x * s; });
+}
 
 // ---------- Hilfsfunktionen ----------
 function mulberry32(a) {
@@ -94,6 +111,83 @@ function fmtTime(t) {
 }
 function loadHigh() { try { return +localStorage.getItem('muc-turbo-high') || 0; } catch { return 0; } }
 function saveHigh(v) { try { localStorage.setItem('muc-turbo-high', String(v)); } catch { /* egal */ } }
+function loadName() { try { return localStorage.getItem('muc-turbo-name') || ''; } catch { return ''; } }
+function saveName(v) { try { localStorage.setItem('muc-turbo-name', v); } catch { /* egal */ } }
+
+// ---------- Online-Bestenliste (Supabase) ----------
+const SB = window.SUPABASE_CONFIG || {};
+const ONLINE = !!(SB.url && SB.anonKey);
+let leaderboard = [], lbStatus = ONLINE ? 'loading' : 'off';
+let entry = null; // Namenseingabe nach dem Rennen: { name, state: 'typing' | 'sending' | 'done' | 'skipped' | 'error' }
+
+async function sbFetch(path, opts = {}) {
+  const res = await fetch(`${SB.url.replace(/\/$/, '')}/rest/v1/${path}`, {
+    ...opts,
+    headers: { apikey: SB.anonKey, 'Content-Type': 'application/json', ...opts.headers },
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.status === 204 || res.status === 201 ? null : res.json();
+}
+
+async function loadLeaderboard() {
+  if (!ONLINE) return;
+  try {
+    leaderboard = await sbFetch('highscores?select=name,score,race_time,place&order=score.desc,race_time.asc&limit=10');
+    lbStatus = 'ok';
+  } catch (e) {
+    console.warn('Bestenliste konnte nicht geladen werden:', e);
+    lbStatus = 'error';
+  }
+}
+
+// Spiel-Einstellungen aus der Tabelle "config" (key → value)
+async function loadConfig() {
+  if (!ONLINE) return;
+  try {
+    const rows = await sbFetch('config?select=key,value');
+    const cfg = Object.fromEntries(rows.map(r => [r.key, r.value]));
+    if (Number.isFinite(+cfg.track_length_m)) trackLengthM = +cfg.track_length_m;
+    if (state === 'menu') setupRace();
+  } catch (e) {
+    console.warn('Config konnte nicht geladen werden, nutze Standardwerte:', e);
+  }
+}
+
+async function submitScore() {
+  const name = entry.name.trim();
+  entry.state = 'sending';
+  try {
+    await sbFetch('highscores', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        name, score: result.total, race_time: +result.time.toFixed(2), place: result.place,
+        track_length_m: Math.round(FINISH / PX_PER_M),
+      }),
+    });
+    saveName(name);
+    entry.state = 'done';
+    await loadLeaderboard();
+  } catch (e) {
+    console.warn('Highscore konnte nicht gespeichert werden:', e);
+    entry.state = 'error';
+  }
+}
+
+// Tastatur während der Namenseingabe; true = Taste wurde verbraucht
+function handleNameKey(e) {
+  if (state !== 'results' || !entry || !['typing', 'error'].includes(entry.state)) return false;
+  if (e.key === 'Enter') { if (entry.name.trim()) submitScore(); return true; }
+  if (e.key === 'Escape') { entry.state = 'skipped'; return true; }
+  if (e.key === 'Backspace') { e.preventDefault(); entry.name = entry.name.slice(0, -1); return true; }
+  if (e.key.length === 1) {
+    e.preventDefault();
+    if (/[\p{L}\p{N} ._-]/u.test(e.key) && entry.name.length < 12) entry.name += e.key;
+    entry.state = 'typing';
+    return true;
+  }
+  return false;
+}
 
 // ---------- Sound ----------
 let actx = null, engine = null, muted = false;
@@ -134,6 +228,7 @@ addEventListener('keydown', e => {
   if (GAME_KEYS.includes(e.code)) e.preventDefault();
   initAudio();
   if (actx && actx.state === 'suspended') actx.resume();
+  if (handleNameKey(e)) return;
   if (!keys[e.code]) onPress(e.code);
   keys[e.code] = true;
 });
@@ -146,6 +241,7 @@ const backDown = () => keys.ArrowLeft || keys.KeyA;
 function onPress(code) {
   if (code === 'KeyM') { muted = !muted; return; }
   if (state === 'menu' || state === 'results') {
+    if (entry && entry.state === 'sending') return;
     if (code === 'Enter' || code === 'Space') startRace();
     return;
   }
@@ -172,6 +268,7 @@ function makeCar(name, kind, lane, x, color, max, skill = 1) {
 }
 
 function setupRace() {
+  applyTrackLength();
   const rnd = mulberry32((Math.random() * 1e9) | 0);
   player = makeCar('Du (Porsche)', 'porsche', 1, 0, '#d4101e', 920);
   player.isPlayer = true;
@@ -357,11 +454,12 @@ function collisions() {
 function onPlayerFinish() {
   const place = finishOrder.indexOf(player) + 1;
   const placeBonus = [500, 300, 150, 50][place - 1];
-  const timeBonus = Math.max(0, Math.round((120 - time) * 10));
+  const timeBonus = Math.max(0, Math.round((120 * FINISH / BASE_FINISH - time) * 10));
   const total = score + placeBonus + timeBonus;
   const isNew = total > highscore;
   if (isNew) { highscore = total; saveHigh(total); }
   result = { place, placeBonus, timeBonus, total, isNew, time };
+  entry = ONLINE ? { name: loadName(), state: 'typing' } : null;
   [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.2, 'square', 0.06), i * 140));
 }
 
@@ -1139,6 +1237,59 @@ function drawMenu() {
   ctx.fillText('Brezn = 10 Punkte · Weißwurst = Turbo · Pylonen & Verkehr bremsen dich aus', W / 2, 470);
   if (Math.floor(menuT * 2) % 2 === 0) text('ENTER DRÜCKEN ZUM STARTEN', W / 2, 500, 14, '#7CFC00');
   if (highscore) text(`HIGHSCORE ${highscore}`, W / 2, 526, 9, '#ffd84a');
+
+  if (ONLINE) {
+    panel(W / 2 + 262, 290, 190, 160, 0.8);
+    text('ONLINE TOP 5', W / 2 + 357, 308, 8, '#9fc3e6');
+    if (lbStatus !== 'ok' || !leaderboard.length) {
+      const msg = lbStatus === 'loading' ? 'Lädt…' : lbStatus === 'error' ? 'Nicht erreichbar' : 'Noch keine Einträge';
+      ctx.font = `13px ${SANS}`; ctx.fillStyle = '#cfe0f5'; ctx.textAlign = 'center';
+      ctx.fillText(msg, W / 2 + 357, 370);
+    }
+    leaderboard.slice(0, 5).forEach((r, i) => {
+      const y = 334 + i * 24;
+      ctx.font = `13px ${SANS}`; ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(`${i + 1}. ${r.name}`, W / 2 + 274, y);
+      ctx.textAlign = 'right'; ctx.fillStyle = '#ffd84a';
+      ctx.fillText(String(r.score), W / 2 + 440, y);
+    });
+  }
+}
+
+function drawOnlineTop10(x, y) {
+  text('ONLINE TOP 10', x + 155, y + 25, 12, '#9fc3e6');
+  if (!leaderboard.length) {
+    ctx.font = `14px ${SANS}`; ctx.fillStyle = '#cfe0f5'; ctx.textAlign = 'center';
+    ctx.fillText(lbStatus === 'error' ? 'Bestenliste nicht erreichbar' : 'Noch keine Einträge', x + 155, y + 120);
+    return;
+  }
+  const mine = entry && entry.state === 'done' ? entry.name.trim() : null;
+  leaderboard.forEach((r, i) => {
+    const ry = y + 52 + i * 19;
+    const isMe = r.name === mine && r.score === result.total;
+    ctx.font = `${isMe ? 'bold ' : ''}13px ${SANS}`; ctx.fillStyle = isMe ? '#ffd84a' : '#fff';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(`${i + 1}. ${r.name}`, x + 20, ry);
+    ctx.textAlign = 'right'; ctx.fillStyle = isMe ? '#ffd84a' : '#cfe0f5';
+    ctx.fillText(fmtTime(r.race_time), x + 220, ry);
+    ctx.fillText(String(r.score), x + 290, ry);
+  });
+}
+
+function drawNameEntry() {
+  panel(W / 2 - 330, 402, 660, 64, 0.85);
+  if (entry.state === 'sending') {
+    text('WIRD GESPEICHERT…', W / 2, 434, 12, '#9fc3e6');
+    return;
+  }
+  const cursor = Math.floor(performance.now() / 400) % 2 ? '_' : ' ';
+  text('DEIN NAME:', W / 2 - 310, 424, 11, '#9fc3e6', 'left');
+  text(entry.name + cursor, W / 2 - 160, 424, 14, '#ffd84a', 'left');
+  ctx.font = `13px ${SANS}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = entry.state === 'error' ? '#ff8a5c' : '#cfe0f5';
+  ctx.fillText(entry.state === 'error'
+    ? 'Speichern fehlgeschlagen – Enter für neuen Versuch, Esc zum Überspringen'
+    : 'Enter = in die Online-Bestenliste eintragen · Esc = überspringen', W / 2, 451);
 }
 
 function drawResults() {
@@ -1148,8 +1299,9 @@ function drawResults() {
   text('Olympiapark erreicht', W / 2, 115, 11, '#9fc3e6');
 
   panel(W / 2 - 330, 140, 310, 250, 0.85);
-  text('ERGEBNIS', W / 2 - 175, 165, 12, '#9fc3e6');
-  const order = [...finishOrder, ...racers.filter(c => !c.finished).sort((a, b) => b.x - a.x)];
+  const order = entry && entry.state === 'done' ? [] : [...finishOrder, ...racers.filter(c => !c.finished).sort((a, b) => b.x - a.x)];
+  if (order.length) text('ERGEBNIS', W / 2 - 175, 165, 12, '#9fc3e6');
+  else drawOnlineTop10(W / 2 - 330, 140);
   order.forEach((c, i) => {
     const y = 205 + i * 44;
     circle(W / 2 - 300, y, 7, c.color);
@@ -1177,11 +1329,14 @@ function drawResults() {
   text(String(r.total), W / 2 + 310, 335, 18, '#ffd84a', 'right');
   text(r.isNew ? 'NEUER HIGHSCORE!' : `Highscore: ${highscore}`, W / 2 + 175, 370, 9, r.isNew ? '#7CFC00' : '#9fc3e6');
 
-  if (Math.floor(performance.now() / 500) % 2 === 0) text('ENTER FÜR NEUES RENNEN', W / 2, 440, 14, '#7CFC00');
+  if (entry && ['typing', 'sending', 'error'].includes(entry.state)) drawNameEntry();
+  else if (Math.floor(performance.now() / 500) % 2 === 0) text('ENTER FÜR NEUES RENNEN', W / 2, 440, 14, '#7CFC00');
 }
 
 // ---------- Hauptschleife ----------
 setupRace();
+loadConfig();
+loadLeaderboard();
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.033, (now - last) / 1000);
